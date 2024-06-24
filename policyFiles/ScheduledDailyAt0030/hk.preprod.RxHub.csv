@@ -1,0 +1,6 @@
+/data/talend/talend/logs/RxHub/order2Dispense_SendMessage*.log*,30,30
+/data/talend/talend/logs/RxHub/order2Dispense_SendMessage/AKV,30,30
+/data/talend/talend/logs/RxHub/OrderStatus,30,30
+/data/talend/talend/logs/RxHub/ErrorQueueRetry_order2Dispense,30,30
+/data/talend/talend/logs/RxHub/ErrorQueueRetry_OrderStatus,30,30
+/data/talend/talend/scripts/RxHub/logs,30,30
