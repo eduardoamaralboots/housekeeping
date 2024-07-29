@@ -1,0 +1,161 @@
+
+parameters:
+- name: apigeeEnvironment
+- name: apigeeEnvironmentDescription
+- name: apigeeEnvironmentGroup
+- name: apigeeOrganization
+- name: apigeeEnvironmentTicket
+
+
+variables:
+  - ${{ if startsWith(parameters.apigeeOrganization, 'nprod') }}:
+    - name: env
+      value: nprod
+  - ${{ if startsWith(parameters.apigeeOrganization, 'prod') }}:
+    - name: env
+      value: prod
+  - template: /Templates/ado/variables/ado-tl-common-vars.yaml@cicd-dev-automation
+    parameters:
+      location: emea
+      environment: ${{ variables.env }}
+      apigeeOrg: ${{ parameters.apigeeOrganization }}
+
+jobs:
+- template: /Templates/ado/ado-tl-get-pat-token-template.yml@cicd-dev-automation
+  parameters:
+    location: emea
+
+- job: create_apigee_environment
+  dependsOn: ['get_pat']
+  pool:
+    name: ${{ variables.shaPoolName }}
+    demands:
+    - CONTAINER_NAME -equals $(platformagent)
+  variables:
+    - name: PAT
+      value: $[ dependencies.get_pat.outputs['get_pat.PAT'] ] 
+
+  steps:
+  
+  - template: /Templates/ado/steps/ado-tl-get-multiple-secrets.yaml@cicd-dev-automation
+    parameters:
+      secretNameVariables: ${{ variables.apigeeAdminSecret }}
+      outputVars: "apigeeAPI"
+      akv: ${{ variables.apigeeAkvName }}
+  - script: |
+      echo $(apigeeAPI) | base64 -d > ./admin-account.json
+      export GOOGLE_APPLICATION_CREDENTIALS="./admin-account.json"
+      
+      export TOKEN=$(gcloud auth application-default print-access-token)
+
+      curl -X POST \
+        "https://apigee.googleapis.com/v1/organizations/${{ parameters.apigeeOrganization }}/environments" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $TOKEN" \
+        -d '{
+        "name" : "${{ parameters.apigeeEnvironment }}",
+        "displayName" : "${{ parameters.apigeeEnvironment }}",
+        "description" :  "${{ parameters.apigeeEnvironmentDescription }}",
+        "properties" : {
+        "property" : [ {
+        "name" : "features.analytics.data.obfuscation.enabled",
+        "value" : "true"
+        },]
+        }
+        }'
+
+      curl -X POST \
+        "https://apigee.googleapis.com/v1/organizations/${{ parameters.apigeeOrganization }}/envgroups/${{ parameters.apigeeEnvironmentGroup }}/attachments" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        -d '{"environment": "${{ parameters.apigeeEnvironment }}"}'
+        
+    displayName: Curl APIGEE Endpoint
+
+  - task: DeleteFiles@1
+    displayName: 'Remove Account Files'
+    inputs:
+      contents: |
+        ./admin-account.json
+    condition: always() 
+
+  - script: |
+
+      apt-get update
+      apt-get -y install python3-pip
+      pip install ruamel.yaml    
+      # Where is overrides file
+      # rm -r apigee-hybrid-platform
+
+      export repo="https://$(PAT)@dev.azure.com/WBA/EAP/_git/apigee-hybrid-platform"
+      export AZURE_DEVOPS_EXT_PAT=$(PAT)
+
+      git push $repo --delete features/${{ parameters.apigeeEnvironment }}-${{ parameters.apigeeOrganization }}
+      
+      git clone $repo
+
+      git config --global user.name "ADO-git-autopush"
+      git config --global user.email "ado-git-autopush@walgreens.com"
+
+      cd apigee-hybrid-platform
+      git fetch origin
+
+
+      git checkout -b features/${{ parameters.apigeeEnvironment }}-${{ parameters.apigeeOrganization }}
+
+      python3 ../Libraries/python-add-apigee-env-overrides-file.py ${{ parameters.apigeeEnvironment }} ${{ parameters.apigeeOrganization }} ./${{ parameters.apigeeOrganization }}/${{ parameters.apigeeOrganization }}-${{ variables.apigeeVersion }}-overrides.yaml
+
+      git add ./${{ parameters.apigeeOrganization }}/${{ parameters.apigeeOrganization }}-${{ variables.apigeeVersion }}-overrides.yaml
+      
+      git commit -m "${{ parameters.apigeeEnvironmentDescription }} - ${{ parameters.apigeeEnvironmentTicket }}"
+
+      # cat ./${{ parameters.apigeeOrganization }}/${{ parameters.apigeeOrganization }}-${{ variables.apigeeVersion }}-overrides.yaml
+
+      git pull $repo features/${{ parameters.apigeeEnvironment }}-${{ parameters.apigeeOrganization }}
+      git push $repo features/${{ parameters.apigeeEnvironment }}-${{ parameters.apigeeOrganization }}
+
+      
+      echo "Creating PR $DESCRIPTIONPR..."
+      PR_CREATION_RESULT=$(az repos pr create --auto-complete --delete-source-branch \
+       -d "${{ parameters.apigeeEnvironmentDescription }}" --org "https://$(baseURL)/$(organization)"  \
+       --project "${{variables.project}}" -r "apigee-hybrid-platform" -s "features/${{ parameters.apigeeEnvironment }}-${{ parameters.apigeeOrganization }}" -t "master" \
+       --title "Created Apigee Environment ${{ parameters.apigeeEnvironment }}" --work-items ${{ parameters.apigeeEnvironmentTicket }})
+
+      echo "Printing pr_creation_result"
+      echo $PR_CREATION_RESULT
+      echo "Getting PR_ID..."
+      jq -r '.pullRequestId' <<< "$JSON_OUTPUT"
+      export PR_ID=$( jq -r '.pullRequestId'  <<< "$PR_CREATION_RESULT" )
+      if [ -z "$PR_ID" ] ; then
+        echo "There was a problem creating the PR, please verify there is not an active PR for branch $sourceBranch"
+        exit 1
+      fi
+      echo "Adding vote to PR ${PR_ID}..."
+      az repos pr set-vote --org "https://$(baseURL)/$(organization)" --vote approve --id $PR_ID
+      #echo "Adding second vote to PR ${PR_ID}..."
+      #export AZURE_DEVOPS_EXT_PAT=$(PAT-VOTE)
+      #az repos pr set-vote --org "https://$(baseURL)/$(organization)" --vote approve --id $PR_ID
+      #echo "PR ${PR_ID} completed"
+ 
+
+
+    displayName: 'Add Environment to Overrides File'
+
+- job: add_apigee_environment_secret
+
+  pool:
+    name: $(shaPoolname) #wba-eap
+    demands:
+    - CONTAINER_NAME -equals ${{ variables.platformagent }}
+
+  steps:
+  - task: Kubernetes@1
+    inputs:
+      connectionType: Kubernetes Service Connection
+      kubernetesServiceEndpoint: ${{ variables.apigeeSvcConnection }}
+      command: 'login'
+    name: login
+    displayName: '${{ parameters.apigeeOrganization }} Apigee Login'
+
+  - script: |
+      kubectl -n apigee create secret generic ${{ parameters.apigeeOrganization }}-${{ parameters.apigeeEnvironment }}-policy-secret --from-literal=data.properties="initial=secret"
